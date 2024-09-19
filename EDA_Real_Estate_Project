@@ -1,0 +1,181 @@
+# Calling all libraries
+import pandas as pd
+import seaborn as sns
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.express as px
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler
+from pyspark.sql.functions import year, month, to_date, split, col, when, count
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql import SparkSession
+
+# Load the cleaned real estate data into a DataFrame
+df = pd.read_csv('D:\Python Projects\REAL ESTATE PROJECT\DATA\cleaned_real_estate_sales.csv')
+
+# Display the first few rows to verify
+print(df.head())
+
+# Checking Nulls / Missing Vales
+print(df.isnull().sum())
+
+# Visualizing Distribution of Sales Amounts
+# Apply log transformation to sale_amount for better visualization
+plt.figure(figsize=(10,6))
+plt.hist(np.log10(df['sale_amount']), bins=50)
+plt.title('Log-Transformed Distribution of Sale Amounts')
+plt.xlabel('Log10(Sale Amount)')
+plt.ylabel('Frequency')
+plt.show()
+
+#Sale Amount Distribution by Property Type
+plt.figure(figsize=(10,6))
+sns.boxplot(x='property_type', y=np.log10(df['sale_amount']), data=df)
+plt.title('Log-Transformed Sale Amounts by Property Type')
+plt.xticks(rotation=45)
+plt.show()
+
+# First attempt at  plotting the Sale Amount Distribution by Town:
+#plt.figure(figsize=(12,6))
+#sns.boxplot(x='town', y=np.log10(df['sale_amount']), data=df)
+#plt.title('Log-Transformed Sale Amounts by Town')
+#plt.xticks(rotation=90)
+#plt.show()
+
+# The plot generated is difficult to read. Grouping the data by town and get the median sale amount for each town
+town_medians = df.groupby('town')['sale_amount'].median().sort_values(ascending=False).head(10)
+
+# Filter the dataframe to include only these top 10 towns
+filtered_df = df[df['town'].isin(town_medians.index)]
+
+# Plot the filtered data
+plt.figure(figsize=(10,6))
+sns.boxplot(x='town', y=np.log10(filtered_df['sale_amount']), data=filtered_df)
+plt.title('Log-Transformed Sale Amounts by Top 10 Towns (Median Sale Amount)')
+plt.xticks(rotation=45)
+plt.show()
+
+# Attempting to Create a pivot table of median sale amounts by town
+pivot_table = df.pivot_table(values='sale_amount', index='town', aggfunc='median')
+
+# Plot a heatmap of the median sale amount by town
+plt.figure(figsize=(10,15))  # Adjust the figure size to fit all towns
+sns.heatmap(np.log10(pivot_table), cmap="coolwarm", annot=False)
+plt.title('Heatmap of Median Sale Amounts by Town')
+plt.show()
+
+# Plotting with a Jittered Scatterplot - Also a bust
+#plt.figure(figsize=(12,8))
+#sns.stripplot(x='town', y=np.log10(df['sale_amount']), data=df, jitter=True)
+#plt.title('Jittered Plot of Sale Amounts by Town')
+#plt.xticks(rotation=90)
+#plt.show()
+
+
+# Interactive boxplot with Plotly
+fig = px.box(df, x='town', y='sale_amount', log_y=True, title="Interactive Log-Transformed Sale Amounts by Town")
+fig.update_layout(xaxis_tickangle=-45)  # Rotate x-axis labels for better readability
+fig.show()
+
+
+# Initialize a Spark session
+spark = SparkSession.builder.appName("RealEstateAnalysis").getOrCreate()
+
+# Load the cleaned real estate data into a Spark DataFrame
+df_spark = spark.read.csv('D:\Python Projects\REAL ESTATE PROJECT\DATA\cleaned_real_estate_sales.csv', header=True, inferSchema=True)
+
+# Show the first few rows
+df_spark.show(5)
+
+# Deciding features.
+# Deciding how to handle categorical variables
+# Checking for unique elements to see if One-hot encode for categorical variables is appropiate
+print(df['town'].unique())
+print(df['property_type'].unique())
+print(df['residential_type'].unique())
+
+# Dropping rows with null values for the key columns
+df_spark = df_spark.na.drop(subset=['assessed_value', 'sales_ratio', 'date_recorded', 'property_type', 'residential_type', 'town'])
+
+# One-hot encoding categorical variables: Encode Property Type, Residential Type, and Town. Indexing
+indexer_property = StringIndexer(inputCol="property_type", outputCol="property_type_index")
+indexer_residential = StringIndexer(inputCol="residential_type", outputCol="residential_type_index")
+indexer_town = StringIndexer(inputCol="town", outputCol="town_index")
+
+df_spark = indexer_property.fit(df_spark).transform(df_spark)
+df_spark = indexer_residential.fit(df_spark).transform(df_spark)
+df_spark = indexer_town.fit(df_spark).transform(df_spark)
+
+# One-Hot Encoding - Encoders
+encoder_property = OneHotEncoder(inputCol="property_type_index", outputCol="property_type_vec")
+encoder_residential = OneHotEncoder(inputCol="residential_type_index", outputCol="residential_type_vec")
+encoder_town = OneHotEncoder(inputCol="town_index", outputCol="town_vec")
+
+df_spark = encoder_property.fit(df_spark).transform(df_spark)
+df_spark = encoder_residential.fit(df_spark).transform(df_spark)
+df_spark = encoder_town.fit(df_spark).transform(df_spark)
+
+# Assembling assessed_value and sales_ratio into a vector column for scaling
+assembler = VectorAssembler(inputCols=['assessed_value', 'sales_ratio'], outputCol="features_to_scale")
+df_spark = assembler.transform(df_spark)
+
+# Assembling assessed_value and sales_ratio into a vector column for scaling
+# See FAQ as to why StandartScaler and not MinMaxScaler
+scaler = StandardScaler(inputCol="features_to_scale", outputCol="scaled_features", withStd=True, withMean=True)
+scaler_model = scaler.fit(df_spark)
+df_spark = scaler_model.transform(df_spark)
+
+# Extracting time-based features from date_recorded
+df_spark = df_spark.withColumn("date_recorded", to_date(df_spark["date_recorded"], 'MM/dd/yyyy'))
+df_spark = df_spark.withColumn("sale_year", year(df_spark['date_recorded']))
+df_spark = df_spark.withColumn("sale_month", month(df_spark['date_recorded']))
+
+df_spark = df_spark.na.drop(subset=['assessed_value', 'sales_ratio', 'sale_year', 'sale_month', 'property_type', 'residential_type', 'town'])
+
+
+# Droping any rows that have nulls in these key columns
+df_spark = df_spark.na.drop(subset=[
+    'assessed_value', 'sales_ratio',
+    'property_type_vec', 'residential_type_vec', 'town_vec',
+    'sale_year', 'sale_month'
+])
+
+# Assemble all features together, including the scaled ones
+assembler_final = VectorAssembler(inputCols=[
+    'scaled_features',   
+    'sale_year',
+    'sale_month',
+    'property_type_vec',
+    'residential_type_vec',
+    'town_vec'
+], outputCol="final_features", handleInvalid="skip")
+
+df_spark = assembler_final.transform(df_spark)
+
+df_spark.select("final_features").show(5, truncate=False)
+
+
+# Define the regression model
+lr = LinearRegression(featuresCol="final_features", labelCol="sale_amount")
+
+# Split the data into training and testing sets
+train_data, test_data = df_spark.randomSplit([0.8, 0.2], seed=42)
+
+# Training the model
+lr_model = lr.fit(train_data)
+
+# Making predictions
+predictions = lr_model.transform(test_data)
+
+# Evaluating model
+predictions.select("final_features", "sale_amount", "prediction").show(10)
+
+# Calculating RMSE
+evaluator = RegressionEvaluator(labelCol="sale_amount", predictionCol="prediction", metricName="rmse")
+rmse = evaluator.evaluate(predictions)
+print(f"Root Mean Squared Error (RMSE): {rmse}")
+
+# Calculating R² score
+evaluator_r2 = RegressionEvaluator(labelCol="sale_amount", predictionCol="prediction", metricName="r2")
+r2 = evaluator_r2.evaluate(predictions)
+print(f"R² score: {r2}")
